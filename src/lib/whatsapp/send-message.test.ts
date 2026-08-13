@@ -2,10 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import {
+  applySenderName,
   sendMessageToConversation,
   SendMessageError,
   type SendMessageParams,
 } from './send-message';
+import { sendTextMessage } from './meta-api';
 
 // A db that explodes if touched — these tests cover the param
 // validation that MUST short-circuit before any query runs.
@@ -292,12 +294,16 @@ describe('sendMessageToConversation — template persistence (#483)', () => {
 
   it('reads body values out of the structured params shape too', async () => {
     const captured: CapturedWrites = {};
-    await sendMessageToConversation(sendPathDb([TEMPLATE_ROW], captured), 'acct-1', {
-      conversationId: 'cv-1',
-      messageType: 'template',
-      templateName: 'order_update',
-      templateMessageParams: { body: ['B456', 'Monday'] },
-    });
+    await sendMessageToConversation(
+      sendPathDb([TEMPLATE_ROW], captured),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'template',
+        templateName: 'order_update',
+        templateMessageParams: { body: ['B456', 'Monday'] },
+      }
+    );
     expect(captured.message?.content_text).toBe(
       'Your order B456 ships on Monday'
     );
@@ -305,30 +311,39 @@ describe('sendMessageToConversation — template persistence (#483)', () => {
 
   it("does not override the composer's pre-rendered text", async () => {
     const captured: CapturedWrites = {};
-    await sendMessageToConversation(sendPathDb([TEMPLATE_ROW], captured), 'acct-1', {
-      conversationId: 'cv-1',
-      messageType: 'template',
-      templateName: 'order_update',
-      templateParams: ['A123', 'Friday'],
-      contentText: 'rendered by the composer',
-    });
+    await sendMessageToConversation(
+      sendPathDb([TEMPLATE_ROW], captured),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'template',
+        templateName: 'order_update',
+        templateParams: ['A123', 'Friday'],
+        contentText: 'rendered by the composer',
+      }
+    );
     expect(captured.message?.content_text).toBe('rendered by the composer');
   });
 
   it("sends the local row's language when the caller names none", async () => {
     sendTemplateMessage.mockClear();
     const captured: CapturedWrites = {};
-    await sendMessageToConversation(sendPathDb([TEMPLATE_ROW], captured), 'acct-1', {
-      conversationId: 'cv-1',
-      messageType: 'template',
-      templateName: 'order_update',
-      templateParams: ['A123', 'Friday'],
-    });
+    await sendMessageToConversation(
+      sendPathDb([TEMPLATE_ROW], captured),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'template',
+        templateName: 'order_update',
+        templateParams: ['A123', 'Friday'],
+      }
+    );
     // Previously pinned to 'en_US', which matched no row and made Meta
     // reject the send as a missing translation.
     expect(
-      (sendTemplateMessage.mock.calls[0] as unknown as [{ language: string }])[0]
-        .language
+      (
+        sendTemplateMessage.mock.calls[0] as unknown as [{ language: string }]
+      )[0].language
     ).toBe('en');
   });
 
@@ -344,5 +359,96 @@ describe('sendMessageToConversation — template persistence (#483)', () => {
     // name rather than inventing a body.
     expect(captured.message?.content_text).toBeNull();
     expect(captured.conversation?.last_message_text).toBe('[template]');
+  });
+});
+
+// ============================================================
+// Agent-name prefix — the customer-facing "*[Ana]:*" identifier on
+// shared-number inboxes.
+// ============================================================
+
+describe('applySenderName', () => {
+  it('prefixes a text body with the bolded bracketed name', () => {
+    expect(applySenderName('text', 'olá!', 'Ana')).toBe('*[Ana]:* olá!');
+  });
+
+  it('strips markup-breaking characters from the name', () => {
+    expect(applySenderName('text', 'hi', '*Ana*\nAdmin')).toBe(
+      '*[Ana Admin]:* hi'
+    );
+    // Brackets in the profile name can't forge or nest the format.
+    expect(applySenderName('text', 'hi', '[Ana]')).toBe('*[Ana]:* hi');
+  });
+
+  it('returns the text untouched without a usable name', () => {
+    expect(applySenderName('text', 'hi', null)).toBe('hi');
+    expect(applySenderName('text', 'hi', '   ')).toBe('hi');
+    expect(applySenderName('text', 'hi', '*[]*')).toBe('hi');
+  });
+
+  it('never invents text where there is none', () => {
+    expect(applySenderName('text', null, 'Ana')).toBeNull();
+    expect(applySenderName('image', undefined, 'Ana')).toBeNull();
+  });
+
+  it('leaves templates, interactive, and audio untouched', () => {
+    expect(applySenderName('template', 'body', 'Ana')).toBe('body');
+    expect(applySenderName('interactive', 'body', 'Ana')).toBe('body');
+    expect(applySenderName('audio', 'body', 'Ana')).toBe('body');
+  });
+
+  it('prefixes a media caption unless that would break the 1024 cap', () => {
+    expect(applySenderName('image', 'look', 'Ana')).toBe('*[Ana]:* look');
+    const nearCap = 'x'.repeat(1020);
+    expect(applySenderName('image', nearCap, 'Ana')).toBe(nearCap);
+  });
+});
+
+describe('sendMessageToConversation — agent-name prefix', () => {
+  it('sends and persists the prefixed text', async () => {
+    vi.mocked(sendTextMessage).mockClear();
+    const captured: CapturedWrites = {};
+    await sendMessageToConversation(sendPathDb([], captured), 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'seu pedido saiu para entrega',
+      senderName: 'Ana',
+    });
+    expect(vi.mocked(sendTextMessage).mock.calls[0][0].text).toBe(
+      '*[Ana]:* seu pedido saiu para entrega'
+    );
+    // The stored row mirrors what the customer actually received.
+    expect(captured.message?.content_text).toBe(
+      '*[Ana]:* seu pedido saiu para entrega'
+    );
+    expect(captured.conversation?.last_message_text).toBe(
+      '*[Ana]:* seu pedido saiu para entrega'
+    );
+  });
+
+  it('persists the prefixed media caption', async () => {
+    const captured: CapturedWrites = {};
+    await sendMessageToConversation(sendPathDb([], captured), 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'image',
+      mediaUrl: 'https://cdn.example/x.jpg',
+      contentText: 'segue a foto',
+      senderName: 'Bia',
+    });
+    expect(captured.message?.content_text).toBe('*[Bia]:* segue a foto');
+  });
+
+  it('sends verbatim when no senderName is given', async () => {
+    vi.mocked(sendTextMessage).mockClear();
+    const captured: CapturedWrites = {};
+    await sendMessageToConversation(sendPathDb([], captured), 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'mensagem de automação',
+    });
+    expect(vi.mocked(sendTextMessage).mock.calls[0][0].text).toBe(
+      'mensagem de automação'
+    );
+    expect(captured.message?.content_text).toBe('mensagem de automação');
   });
 });

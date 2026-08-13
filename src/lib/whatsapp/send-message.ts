@@ -88,6 +88,15 @@ export interface SendMessageParams {
   /** Structured payload for `messageType === 'interactive'`. */
   interactivePayload?: InteractiveMessagePayload | null;
   replyToMessageId?: string | null;
+  /**
+   * Display name of the human agent sending this message. When set,
+   * free-text bodies and media captions go out prefixed with
+   * `*[Name]:*` so customers can tell which teammate is talking on the
+   * shared number. Callers that aren't a human in the inbox (public
+   * API, automations, AI auto-reply, broadcasts) leave this unset and
+   * send verbatim.
+   */
+  senderName?: string | null;
 }
 
 export interface SendMessageResult {
@@ -119,8 +128,13 @@ export function validateSendMessageParams(params: {
   templateName?: string | null;
   interactivePayload?: InteractiveMessagePayload | null;
 }): void {
-  const { messageType, contentText, mediaUrl, templateName, interactivePayload } =
-    params;
+  const {
+    messageType,
+    contentText,
+    mediaUrl,
+    templateName,
+    interactivePayload,
+  } = params;
 
   if (!messageType) {
     throw new SendMessageError('bad_request', 'message_type is required', 400);
@@ -184,6 +198,36 @@ export function validateSendMessageParams(params: {
   }
 }
 
+/**
+ * Prefix an outbound body/caption with the sending agent's name
+ * (WhatsApp renders `*…*` bold: "*[Ana]:* olá"). Only free-text is
+ * touched: template bodies are Meta-approved verbatim, interactive
+ * payloads are validated structures, audio carries no caption. A
+ * caption the prefix would push past Meta's 1024-char cap is sent
+ * unprefixed rather than failing the whole send. `*`, `[`/`]`, and
+ * newlines are stripped from the name so a crafted profile name can't
+ * break the bold markup, forge the bracket format, or spoof a
+ * multi-line message.
+ */
+export function applySenderName(
+  messageType: string,
+  contentText: string | null | undefined,
+  senderName: string | null | undefined
+): string | null {
+  const text = contentText ?? null;
+  const name = senderName?.replace(/[*[\]\r\n]+/g, ' ').trim();
+  if (!name || !text) return text;
+
+  const isCaptionedMedia =
+    (MEDIA_KINDS as readonly string[]).includes(messageType) &&
+    messageType !== 'audio';
+  if (messageType !== 'text' && !isCaptionedMedia) return text;
+
+  const prefixed = `*[${name}]:* ${text}`;
+  if (isCaptionedMedia && prefixed.length > 1024) return text;
+  return prefixed;
+}
+
 export async function sendMessageToConversation(
   db: SupabaseClient,
   accountId: string,
@@ -201,6 +245,7 @@ export async function sendMessageToConversation(
     templateMessageParams,
     interactivePayload,
     replyToMessageId,
+    senderName,
   } = params;
 
   if (!conversationId) {
@@ -220,6 +265,13 @@ export async function sendMessageToConversation(
   });
 
   const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(messageType);
+
+  // What actually goes out (and gets persisted) for text bodies and
+  // media captions: the caller-supplied text, agent-name prefix
+  // included when `senderName` is set. Validation above ran on the raw
+  // text; the caption-cap edge the prefix could introduce is handled
+  // inside applySenderName by skipping the prefix.
+  const outboundText = applySenderName(messageType, contentText, senderName);
 
   // Conversation + contact, account-scoped.
   const { data: conversation, error: convError } = await db
@@ -358,7 +410,7 @@ export async function sendMessageToConversation(
         to: phone,
         kind: messageType as MediaKind,
         link: mediaUrl!,
-        caption: contentText || undefined,
+        caption: outboundText || undefined,
         filename: filename || undefined,
         contextMessageId,
       });
@@ -396,7 +448,7 @@ export async function sendMessageToConversation(
       phoneNumberId: config.phone_number_id,
       accessToken,
       to: phone,
-      text: contentText!,
+      text: outboundText!,
       contextMessageId,
     });
     return result.messageId;
@@ -466,7 +518,7 @@ export async function sendMessageToConversation(
             templateBodyParams(templateParams, templateMessageParams),
             contentText
           )
-        : (contentText ?? null);
+        : outboundText;
 
   const { data: messageRecord, error: msgError } = await db
     .from('messages')
